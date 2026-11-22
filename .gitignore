@@ -5,3 +5,4 @@ coverage/
 
 # Original assignment PDF (contains hidden text); see docs/ASSIGNMENT.md
 docs/*.pdf
+.vitest/

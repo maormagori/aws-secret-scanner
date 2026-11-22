@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    command: ["node", "dist/src/apiMain.js"]
+    environment:
+      PORT: 3000
+      DATA_DIR: /data
+      DATABASE_FILE: /data/scanner.db
+    ports:
+      - "3000:3000"
+    volumes:
+      - scanner-data:/data
+
+  worker:
+    build: .
+    command: ["node", "dist/src/workerMain.js"]
+    environment:
+      DATA_DIR: /data
+      DATABASE_FILE: /data/scanner.db
+      CLONES_DIR: /tmp/clones
+      # No value: passed through only when set on the host. An empty string would be sent to GitHub as a token.
+      GITHUB_TOKEN:
+    volumes:
+      - scanner-data:/data
+    deploy:
+      replicas: 2
+
+volumes:
+  scanner-data:
