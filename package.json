@@ -7,13 +7,16 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev:api": "tsx watch src/apiMain.ts",
+    "dev:worker": "tsx watch src/workerMain.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run lint && npm test"
+    "check": "npm run typecheck && npm run lint && npm test",
+    "start:api": "node dist/src/apiMain.js",
+    "start:worker": "node dist/src/workerMain.js"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
@@ -25,6 +28,7 @@
     "vitest": "^5.1.1"
   },
   "dependencies": {
+    "fastify": "^5.12.8",
     "http-status-codes": "^2.3.0",
     "pino": "^10.4.0",
     "zod": "^4.6.7"
