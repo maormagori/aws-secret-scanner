@@ -1,0 +1,15 @@
+services:
+  dashboard:
+    image: node:24-alpine
+    command: ["node", "/demo-ui/server.mjs"]
+    environment:
+      DATABASE_FILE: /data/scanner.db
+      API_URL: http://api:3000
+    ports:
+      - "${DASHBOARD_PORT:-3200}:3200"
+    volumes:
+      - ./demo-ui:/demo-ui:ro
+      - scanner-data:/data:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - api
