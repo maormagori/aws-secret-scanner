@@ -88,25 +88,25 @@ While this runs, the worker sends a "still alive" signal every 10 seconds (the h
 
 ```mermaid
 stateDiagram-v2
+  direction LR
   [*] --> queued: POST /scans
-  queued --> cloning: a slot takes it
-  cloning --> scanning: repo downloaded, list ready
-  scanning --> completed: last page saved
-  completed --> [*]
-
-  cloning --> queued: network error or timeout (wait, then retry) / shutdown
-  scanning --> queued: network error or timeout (wait, then retry) / shutdown
-  cloning --> failed: repo not found, bad token, or too many tries
-  scanning --> failed: history changed, or too many tries
-  cloning --> cloning: worker died, another slot takes over
-  scanning --> cloning: worker died, another slot takes over
-
-  queued --> stopped: POST /stop
-  cloning --> stopped: POST /stop
-  scanning --> stopped: POST /stop (after the current page)
-  stopped --> queued: POST /resume
-  failed --> queued: POST /resume
+  queued --> running: slot takes it
+  state running {
+    direction LR
+    cloning --> scanning: list ready
+  }
+  running --> completed: last page saved
+  running --> queued: retry later
+  running --> failed: give up
+  running --> stopped: stop
+  queued --> stopped: stop
+  stopped --> queued: resume
+  failed --> queued: resume
 ```
+
+`running` is just a box around `cloning` and `scanning`: everything that can happen to one can happen to the other.
+Not drawn, to keep it readable: if the worker dies, its lease runs out and another slot takes the scan, which starts
+again at `cloning`. The table below has every move and its exact reason.
 
 | From | To | When | Who does it |
 |---|---|---|---|
