@@ -84,8 +84,48 @@ While this runs, the worker sends a "still alive" signal every 10 seconds (the h
 | `failed` | Stopped for good: repo not found, bad token, history rewritten, or too many tries. `POST /resume` puts it back in the queue |
 | `stopped` | Someone called `POST /stop`. `POST /resume` puts it back in the queue |
 
-Every status change is checked against a list of allowed moves (`src/domain/scanStateMachine.ts`) and saved with
-"change it *only if* it's still in the status I think it's in". If someone else changed it first, nothing is saved.
+### How a scan moves between statuses
+
+```mermaid
+stateDiagram-v2
+  [*] --> queued: POST /scans
+  queued --> cloning: a slot takes it
+  cloning --> scanning: repo downloaded, list ready
+  scanning --> completed: last page saved
+  completed --> [*]
+
+  cloning --> queued: network error or timeout (wait, then retry) / shutdown
+  scanning --> queued: network error or timeout (wait, then retry) / shutdown
+  cloning --> failed: repo not found, bad token, or too many tries
+  scanning --> failed: history changed, or too many tries
+  cloning --> cloning: worker died, another slot takes over
+  scanning --> cloning: worker died, another slot takes over
+
+  queued --> stopped: POST /stop
+  cloning --> stopped: POST /stop
+  scanning --> stopped: POST /stop (after the current page)
+  stopped --> queued: POST /resume
+  failed --> queued: POST /resume
+```
+
+| From | To | When | Who does it |
+|---|---|---|---|
+| — | `queued` | `POST /scans` for a repo with no active scan | API |
+| `queued` | `cloning` | A free slot takes the oldest waiting scan | Worker |
+| `cloning` | `scanning` | Repo downloaded, ref tips saved, commit list sorted | Worker |
+| `scanning` | `completed` | The last page is saved | Worker |
+| `cloning` / `scanning` | `queued` | Network error or timeout: waits 5 s, 10 s, 20 s… before it can be taken again. Also on a clean shutdown (no try counted) | Worker |
+| `cloning` / `scanning` | `failed` | Repo not found, bad token, history changed, or 3 tries in a row with no progress | Worker |
+| `cloning` / `scanning` | `cloning` | The owner died: its lease ran out and another slot took the scan. It starts over at `cloning` because it must download again | Worker (the new one) |
+| `queued` | `stopped` | `POST /stop` on a waiting scan: right away | API |
+| `cloning` / `scanning` | `stopped` | `POST /stop` sets a flag; the worker sees it on its next heartbeat and stops after the current page | API asks, worker does it |
+| `stopped` / `failed` | `queued` | `POST /resume`. Tries reset to 0; continues from its placeholder | API |
+| `completed` | — | Final. To scan again, create a new scan | — |
+
+Every status change is checked against this list of allowed moves (`src/domain/scanStateMachine.ts`); a move that
+isn't listed is a bug and throws. It's then saved with "change it *only if* it's still in the status I think it's in
+(and, for workers, only if my lease token is still current)". If someone else changed it first, nothing is saved and
+the caller is told it lost.
 
 ## When things go wrong
 
