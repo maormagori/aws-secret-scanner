@@ -70,7 +70,8 @@ diff before it's committed. Workers never merge.
 
 ```bash
 npm ci
-npm run dev          # tsx watch src/index.ts
+npm run dev:api      # tsx watch src/apiMain.ts
+npm run dev:worker   # tsx watch src/workerMain.ts
 npm run typecheck    # tsc --noEmit
 npm run lint         # eslint
 npm test             # vitest run

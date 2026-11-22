@@ -30,25 +30,30 @@ secondary limits, and keep a page cursor per branch as the checkpoint.
 
 ## 2. Blobless clone (paging the download)
 
-**What.** `--filter=blob:none` downloads all commits and directory trees, but not file contents. When we diff a page of
-commits, git fetches just the file contents that page needs.
+**What.** `--filter=blob:none` downloads all commits and directory trees, but not file contents. Before each page of
+commits is diffed, we list the file versions the page needs (`git diff-tree`, local), skip the ones we already have,
+and download the rest in **one** `git fetch` (blob SHAs on stdin). Git's own on-demand fetch stays on as a fallback.
 
-**Why.** It turns one huge download into many small ones, in the same order as the scan:
+**Why.** It turns one huge download into one small download per page, in the same order as the scan:
 - The first findings come fast, instead of after a 10 GB clone.
 - Disk use grows with progress instead of all up front.
 - The commit list (needed for sorting) arrives in seconds, because commits and trees are small.
 
-**What we gave up.** The scan needs the network the whole time, not only at the start. A network error in the middle
-of a scan is treated like any retryable failure: the scan goes back to the queue and resumes from its checkpoint.
+**Why the prefetch step.** Left alone, `git log -p` in a blobless clone fetches missing contents about once per commit
+(measured on the fixture: 12 fetches for 13 commits). For a million commits that's a million small requests, the
+pattern GitHub is most likely to throttle. With the prefetch it's one request per page of 200 commits (fixture: 12 → 1).
+Git traffic isn't counted in the REST API's 5,000/hour, but GitHub does throttle heavy git traffic, especially without a
+token; a throttled fetch fails the page, and the scan retries with backoff from its placeholder.
+
+**What we gave up.** The scan needs the network the whole time, not only at the start. A network error mid-scan is a
+retryable failure: back to the queue, resume from the checkpoint. For a repo GitHub would throttle even at one fetch
+per page, a full clone (one download, zero calls during the scan) is the better trade.
 
 **Likely question:** *"How do you handle paging for a huge repo?"* Paging happens at three layers:
-1. **Download:** blobless clone; contents fetched per page of commits.
+1. **Download:** blobless clone; contents fetched in one request per page of commits.
 2. **Processing:** pages of 200 commits (`BATCH_SIZE`); each page writes its findings and the checkpoint in one
    transaction.
 3. **Results:** the findings API uses a keyset cursor.
-
-The trade-off we chose: fast start and disk that grows with progress, in exchange for network dependence during the
-scan, which our retries and checkpoints already cover.
 
 ---
 
@@ -137,7 +142,7 @@ saved atomically with that page's findings.
 | cloning | scanning | clone ready, ref tips frozen |
 | scanning | completed | last page written |
 | cloning / scanning | queued | retryable error (with backoff), or graceful shutdown |
-| cloning / scanning | failed | non-retryable error, or attempts used up |
+| cloning / scanning | failed | non-retryable error, deliveries used up, or abandoned `maxDeliveries` times (checked at claim) |
 | queued / cloning / scanning | stopped | stop requested |
 | stopped / failed | queued | resume requested |
 | cloning / scanning | cloning | another worker reclaims it after the lease expired |
@@ -177,18 +182,27 @@ the lease expires and work continues elsewhere.
 
 ---
 
-## 9. Retries, backoff and error classes
+## 9. Retries, backoff, delivery count and the dead-letter state
 
 **What.**
 - **Non-retryable** (fail at once): repo not found, authentication failed, history rewritten.
-- **Retryable**: network errors, timeouts. The scan goes back to `queued` with
-  `runAfter = now + retryBaseMs × 2^attempt` (5 s, 10 s, 20 s, …), and fails after `maxAttempts` (3).
-- A crash counts as an attempt (the reclaim increments `attempt`), so a repo that crashes workers every time ends up
-  `failed` instead of looping forever.
-- A graceful shutdown does **not** count as an attempt.
+- **Retryable**: network errors, timeouts, unknown errors. The scan goes back to `queued` with
+  `runAfter = now + retryBaseMs × 2^(deliveryCount - 1)` (5 s, 10 s, 20 s, …).
+- **`deliveryCount`** works like an SQS receive count: it goes up by one on every claim, not when a run fails. A crashed
+  worker can't report anything, so counting at the claim is the only way a crash is counted.
+- **`failed` is the dead-letter queue.** The limit (`maxDeliveries`, default 3) is checked in two places:
+  - **At claim:** inside the claim transaction, every running scan with an expired lease and
+    `deliveryCount >= maxDeliveries` is moved to `failed` ("Scan was abandoned by workers 3 times without progress")
+    instead of being claimed again. Without this, a repo that crashes the worker every time would loop forever.
+  - **On a reported failure:** the worker re-reads the scan and retries only while `deliveryCount < maxDeliveries`.
+- **Progress resets the count.** Every saved page sets `deliveryCount = 1` (the current delivery), so it means
+  "deliveries in a row without progress". A huge repo that crashes now and then but keeps moving is never failed.
+- **`POST /resume` (the redrive)** sets `deliveryCount = 0`.
+- **A graceful shutdown refunds** the delivery (`deliveryCount - 1`): stopping the worker is not the scan's fault.
 
 **Why.** Retrying a 404 wastes time; giving up on a network blip wastes the scan. Exponential backoff avoids hammering
-GitHub while it's having trouble.
+GitHub while it's having trouble. Counting at claim and resetting on progress is what lets crashes be counted at all
+without punishing slow-but-moving scans.
 
 ---
 
@@ -196,7 +210,7 @@ GitHub while it's having trouble.
 
 **What.** `POST /scans/:id/stop` sets `stopRequested`. A queued scan stops at once; a running one notices at its next
 heartbeat and stops after the current page, so the checkpoint is always on a page boundary.
-`POST /scans/:id/resume` moves a `stopped` or `failed` scan back to `queued` with its attempts reset; it continues from
+`POST /scans/:id/resume` moves a `stopped` or `failed` scan back to `queued` with its `deliveryCount` reset; it continues from
 its checkpoint.
 
 **Why a flag instead of killing the worker.** The worker owns the scan and is the only one allowed to write it (fencing
@@ -222,7 +236,7 @@ The right unit for splitting one huge repo is a **range of the sorted commit lis
 | Two API requests create a scan for the same repo | Unique partial index on active `repoUrl`; the loser gets the existing scan |
 | A page is replayed after a crash | Findings unique key + checkpoint in the same transaction |
 | Stop arrives while a page is mid-write | Checked between pages; transitions are compare-and-set |
-| Two scans' git files collide | One clone directory per scan, owned by the lease holder |
+| Two scans' git files collide, or a stalled worker deletes the new owner's clone | One clone directory per claim (`<scanId>-<leaseToken>`); each worker only deletes its own |
 
 ---
 
@@ -234,7 +248,15 @@ The right unit for splitting one huge repo is a **range of the sorted commit lis
 safely (with `busy_timeout` for short waits).
 
 **What we gave up.** SQLite can't be shared across hosts. For that, swap the two repositories for Postgres versions;
-the claim becomes `SELECT … FOR UPDATE SKIP LOCKED`. No other code changes, because all SQL lives in the repositories.
+the claim becomes `SELECT … FOR UPDATE SKIP LOCKED`. All SQL lives in the repositories, so the queries change only there. One honest catch: `node:sqlite`
+is synchronous, so repository methods return plain values today. A Postgres driver is async, so the repository
+methods would return Promises and the runner, pool and service would `await` them: a mechanical change, but not a
+repository-only one.
+
+**Why SQLite is enough on one host.** File locks let several processes share the file; `BEGIN IMMEDIATE` takes the
+write lock before reading, so two workers can't claim the same scan; WAL lets the API read while a worker writes. The
+limits are real but elsewhere: one host only (locks aren't reliable over network filesystems) and one writer at a time
+(fine for our small, infrequent writes; not for hundreds of workers).
 
 ---
 
@@ -258,13 +280,21 @@ predictable memory and time over scanning generated or vendored blobs.
 
 ---
 
-## 14. Containers: one image, two roles
+## 14. Containers: one image, two entry points
 
-**What.** One Docker image; `ROLE=api`, `ROLE=worker` or `ROLE=all`. Compose runs one `api` and two `worker`
-containers sharing a volume for the SQLite file. Each worker's clones stay inside its own container.
+**What.** One Docker image. `src/apiMain.ts` starts the API, `src/workerMain.ts` starts the worker pool; both call
+`src/bootstrap.ts` for what they share (config, logger, DB, repositories, shutdown handling). Compose runs one `api`
+container and two `worker` containers, each with its own `command`, sharing a volume for the SQLite file. Each worker's
+clones stay inside its own container. Every log line carries its role as a prefix (`[api] …`, `[worker] …`) and as a
+structured field.
 
-**Why.** The API is light and must answer fast; workers are heavy (git, disk, CPU). Separate roles let them scale
-separately and let a worker crash without taking the API down. One image keeps the build simple.
+**Why.** The API is light and must answer fast; workers are heavy (git, disk, CPU). Separate entry points let them
+scale separately, let a worker crash without taking the API down, and make each start-up file read top to bottom with no
+role branching. One image keeps the build simple.
+
+**What we gave up.** Running locally takes two processes (`npm run dev:api`, `npm run dev:worker`). The earlier version
+used one entry point with `ROLE=api|worker|all`: fewer files and one command for dev, but every process loaded all the
+code and the start-up had role `if`s.
 
 ---
 
@@ -300,3 +330,67 @@ types.
 - Git LFS contents (only pointer files are scanned).
 - Auth on our own API.
 - Concurrency tests (the design covers it; the assignment doesn't ask for tests).
+
+---
+
+## 18. How workers fetch work: polling the database
+
+**What.** Each worker slot loops: `claimNextScan` → if nothing, wait `pollMs` (1 s) → try again. The claim takes the
+oldest scan that is `queued` (and past its `runAfter`, not stop-requested) **or** running with an expired lease, in one
+`BEGIN IMMEDIATE` transaction, and marks it ours: status `cloning`, new lease, `leaseToken + 1`, `deliveryCount + 1`. Before picking, the same transaction
+moves scans that ran out of deliveries to `failed` (see 9).
+
+**Why polling.**
+- The database is the queue: nothing is lost if a process dies, and picking up orphans is the same query as picking up
+  new work (no separate reaper).
+- No extra infrastructure (Redis, SQS, RabbitMQ).
+- Cost: one indexed query per idle slot per second, and up to 1 s before a new scan starts. Negligible for scans that
+  take minutes.
+
+**At scale.** Postgres: `SELECT … FOR UPDATE SKIP LOCKED` so many workers claim in parallel without waiting on each
+other; `LISTEN/NOTIFY` to wake workers on insert, with polling kept as the fallback for leases and backoffs. A broker
+only for very high volume, and even then the database stays the source of truth for state and checkpoints.
+
+**Known gap: fairness.** Oldest-first is FIFO across everyone, so one tenant queuing 1,000 repos delays the rest. Fix: a
+per-tenant cap in the claim query, which needs a tenant on the scan (see 19).
+
+---
+
+## 19. No `repos` table (yet)
+
+**What.** A repo is its normalized URL, stored on each scan. No separate `repos` table.
+
+**Why.** A repo has one attribute today, its URL, and nothing in the assignment is per repo. Everything we need works
+without it: one active scan per repo (unique partial index), a repo's history (`WHERE repoUrl = ?`), one spelling per
+repo (`parseRepoUrl` normalizes).
+
+**When it would come in.** The day a repo has real columns:
+- incremental rescans: `lastCompletedScanId`, `lastRefTips` (scan only what's new since then);
+- tenants/orgs: `tenantId`, scan a whole org, fairness between tenants (18);
+- per-repo settings: token reference, schedule, ignored paths;
+- identity across renames: GitHub's numeric repo id.
+
+**Likely question:** *"Why isn't the repo its own entity?"* "I didn't add a table that only holds a URL. Incremental
+rescans or tenants would give it real columns, and that's when it comes in."
+
+---
+
+## 20. Streaming unit: one commit, not one line
+
+**What.** `git log -p` output is read line by line from the pipe (`readline`), and git pauses when we read slower, so
+the pipe never holds more than a small buffer. The diff parser, though, collects every **added** line of the current
+commit in an array (`CommitDiff.addedLines`) and hands the whole commit to the runner when the next commit starts. The
+runner runs the detector on those lines and keeps only the findings. Removed lines, context lines and binary files are
+never kept.
+
+**Why.** A commit is a natural unit: the parser's output is a plain value that is easy to test, and the runner sees one
+complete commit with its metadata. For normal commits the array is tiny.
+
+**What we gave up.** Memory per commit grows with its added lines. A commit that adds a 40 MB text file holds those
+lines until the commit ends. Separately, `readline` needs a whole line, so a single 30 MB line (minified JS) is one 30 MB
+string. `core.bigFileThreshold` (50 MB) caps the worst case by making git skip bigger files as binary.
+
+**The fix if it matters.** Run the detector inside the stream: the parser takes an `onAddedLine` callback (or yields
+lines instead of commits), the detector checks each added line right away, and only findings are kept. Memory per
+commit then becomes its findings, not its lines. For giant single lines: lower the threshold or cut lines above a set
+length (risk: a key past the cut is missed).
