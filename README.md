@@ -8,6 +8,7 @@ leaked value. Scans are jobs in a database queue, so a scan that is interrupted 
 
 ```bash
 docker compose up --build          # 1 api (port 3000) + 2 workers, sharing a SQLite volume
+API_PORT=3100 docker compose up --build   # if port 3000 is taken on your machine (then use localhost:3100 below)
 ```
 
 Or locally (Node 24+, `git` on the PATH), in two terminals:
@@ -91,7 +92,7 @@ that is not `stopped`/`failed`.
 ## How it works
 
 - **Blobless mirror clone:** `git clone --mirror --filter=blob:none` gets every branch, tag and PR ref, but only
-  commits and trees. File contents are fetched as each page of commits is diffed.
+  commits and trees. Before each page is diffed, the file contents it needs are fetched in one request.
 - **Strict sort:** the ref tips are frozen on the first clone; every commit reachable from them is listed once and
   sorted by committer time (newest first), then SHA. Git's own order isn't strict under clock skew.
 - **Pages + checkpoint in one transaction:** each page of `BATCH_SIZE` commits is diffed with `git log -p`, added lines
@@ -112,8 +113,8 @@ Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DESIGN_DECISIONS
 ## Scaling and limits
 
 See the [Scale section](docs/ARCHITECTURE.md#scale). Add worker containers to scan more repos at once; one scan runs
-in order on one worker. SQLite works for several processes on one host; several hosts need Postgres (only the
-repositories change).
+in order on one worker. SQLite works for several processes on one host; several hosts need Postgres (new SQL in the
+repositories, and repository calls become async).
 
 Not built: sharding one huge repo across workers, scanning merge diffs (`--cc`), verifying keys against AWS, other
 secret types, Git LFS content, incremental rescans, and auth on this API.

@@ -7,7 +7,7 @@ services:
       DATA_DIR: /data
       DATABASE_FILE: /data/scanner.db
     ports:
-      - "3000:3000"
+      - "${API_PORT:-3000}:3000"
     volumes:
       - scanner-data:/data
 
