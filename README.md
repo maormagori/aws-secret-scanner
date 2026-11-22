@@ -18,6 +18,8 @@ npm ci && npm run dev:api     # terminal 1
 npm run dev:worker            # terminal 2
 ```
 
+Demo dashboard (live scans, findings and container logs): see [`demo-ui/README.md`](demo-ui/README.md).
+
 Every log line starts with its role, `[api]` or `[worker]`, and also carries a `role` field.
 
 Public repos need no token. For private repos set `GITHUB_TOKEN` (e.g. `GITHUB_TOKEN=ghp_… docker compose up`).
@@ -112,7 +114,7 @@ Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DESIGN_DECISIONS
 
 ## Scaling and limits
 
-See the [Scale section](docs/ARCHITECTURE.md#scale). Add worker containers to scan more repos at once; one scan runs
+See [Big repos](docs/ARCHITECTURE.md#big-repos). Add worker containers to scan more repos at once; one scan runs
 in order on one worker. SQLite works for several processes on one host; several hosts need Postgres (new SQL in the
 repositories, and repository calls become async).
 

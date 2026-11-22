@@ -1,256 +1,204 @@
 # Architecture — AWS Secret Scanner
 
-## What it does
-A web service that takes a GitHub repo, clones it, and scans every commit reachable from any ref (branches, tags, pull
-requests), newest commit first, for leaked AWS credentials. Each finding records the commit, its committer and the
-leaked value. Scans are jobs in a database queue. Workers claim them, write progress as checkpoints, and resume from the
-last checkpoint after a crash, a restart or a stop. The API and the workers can run in separate containers.
+## In one paragraph
 
-The requirements are in [`ASSIGNMENT.md`](ASSIGNMENT.md).
+You give the service a GitHub repo. It downloads the repo's history, looks at every commit on every branch, tag and
+pull request, newest first, and saves every AWS key it finds, with the commit and the person who committed it. Scanning
+happens in the background. If anything breaks halfway (a crash, a restart, a stop), the scan continues later from where
+it stopped, and you never get the same finding twice.
 
-| Requirement | How it is met |
-|---|---|
-| Descending by commit time, every file diff | We sort all commits by committer time ourselves, then feed them to `git log -p` in that order |
-| Continue from the placeholder after an interruption | A checkpoint (position in a frozen, sorted commit list) written in the same transaction as the findings |
-| Commit info, committer, leak value | Stored on each finding, returned by the API |
-| Non-main branches | Mirror clone: every branch, tag and PR ref; each commit scanned once |
-| Web server with an API | Fastify REST API |
-| Containerize | One image, two roles (`api`, `worker`); compose runs 1 api + 2 workers |
-| Delete the clone at the end | A clone directory exists only while a worker holds the scan |
+The assignment itself is in [`ASSIGNMENT.md`](ASSIGNMENT.md). Why each choice was made: [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md).
+The tables in detail: [`ERD.md`](ERD.md).
 
-## Components
+## The big picture
 
 ```
-HTTP ─► api/ (routes) ─► services/scanService ─► db/ (repositories) ◄─ worker/workerPool ─► scanner/scanRunner
-                                                                                             ├─► git/ (clone, list, log stream)
-                                                                                             └─► scanner/detector
+         you (curl / browser)
+                 │
+                 ▼
+        ┌─────────────────┐
+        │   API container │   takes requests, writes "please scan this" into the DB,
+        │   (apiMain.ts)  │   reads results back out of the DB
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │  SQLite file    │   the only thing the containers share.
+        │  scans          │   it is the queue (scans waiting), the progress
+        │  findings       │   (how far each scan got) and the results
+        └────────┬────────┘
+                 ▲
+        ┌────────┴────────┐
+        │ Worker container│ ×2   each runs 3 "slots"; a slot takes one scan
+        │ (workerMain.ts) │      and does the actual work: clone, read diffs,
+        └────────┬────────┘      find keys, save findings
+                 │
+                 ▼
+              GitHub
 ```
 
-| Component | Owns | Files |
-|---|---|---|
-| Config | Env vars parsed and validated once with Zod | `src/config.ts` |
-| Logger | The pino instance, created in the entry point and passed in | `src/logger.ts` |
-| Domain schemas | `Scan`, `Finding`, `ScanStatus`, API request/response shapes, repo URL parsing | `src/domain/*.ts` |
-| Database | Opens SQLite (`node:sqlite`), WAL mode, busy timeout, schema creation | `src/db/database.ts` |
-| Scan repository | All scan SQL: create, claim, renew lease, transition, checkpoint | `src/db/scanRepository.ts` |
-| Finding repository | Insert findings (idempotent), page through them | `src/db/findingRepository.ts` |
-| State machine | The allowed transitions table and the check | `src/domain/scanStateMachine.ts` |
-| Git client | Runs `git` as a child process: mirror clone, list commits, stream `log -p`. Token goes in a header, never in the URL | `src/git/gitClient.ts` |
-| Commit lister | Lists commits reachable from the frozen ref tips and sorts them by committer time | `src/git/commitLister.ts` |
-| Diff parser | Turns the `git log -p` text stream into commits and their added lines (file, line number) | `src/git/diffParser.ts` |
-| Detector | AWS key patterns run over one line | `src/scanner/detector.ts` |
-| Scan runner | Runs one claimed scan from its checkpoint to the end, batch by batch | `src/scanner/scanRunner.ts` |
-| Worker pool | N slots per process: claim, heartbeat, run, retry/backoff, graceful shutdown | `src/worker/workerPool.ts` |
-| Scan service | API business logic: create (dedupe), get, list, stop, resume | `src/services/scanService.ts` |
-| API | Fastify routes, validation, error mapping | `src/api/*.ts` |
-| Entry points | `bootstrap.ts` builds what both need (config, role-prefixed logger, DB, repositories, shutdown); `apiMain.ts` starts the API, `workerMain.ts` starts the worker pool. One entry point per container | `src/bootstrap.ts`, `src/apiMain.ts`, `src/workerMain.ts` |
+The API never talks to GitHub, and the workers never take HTTP requests. They only meet in the database.
 
-## Data model (SQLite)
+## The life of one scan
 
-**scans**
+1. **You ask for a scan.** `POST /scans {"repoUrl": "owner/repo"}`. The API cleans up the URL and adds a row to
+   `scans` with status `queued`. If this repo already has a scan in progress, you get that one back instead of a new one.
+2. **A worker picks it up.** Each free slot asks the database about once a second: "give me the oldest scan that's
+   waiting". Taking it and marking it as ours happens in one step, so two slots can never take the same scan. The
+   status becomes `cloning`.
+3. **The worker downloads the repo.** One `git clone`, which gets every branch, tag and PR, but only the commits and
+   folder structure, not the file contents (that's what "blobless" means). It's fast even for big repos.
+4. **The worker makes the to-do list.** It writes down where every branch, tag and PR points right now (the "ref
+   tips") and saves that on the scan. Then it lists every commit reachable from them, each one once, and sorts them by
+   commit time, newest first. The status becomes `scanning`.
+5. **The worker goes through the list in pages of 200 commits.** For each page:
+   - download the file contents this page needs, in one request;
+   - get the diffs with `git log -p`, read them line by line, and check every **added** line for AWS keys;
+   - save the page's findings **and** "200 more commits done" in one database transaction. Both are saved, or
+     neither is.
+6. **Done.** The status becomes `completed` and the downloaded repo is deleted.
 
-| Column | Meaning |
+While this runs, the worker sends a "still alive" signal every 10 seconds (the heartbeat). You can watch progress with
+`GET /scans/:id` and read the results with `GET /scans/:id/findings`.
+
+## Words used in this project
+
+| Word | Meaning |
 |---|---|
-| `id` | UUID |
-| `repoUrl` | Normalized `https://github.com/owner/repo` |
-| `status` | `queued` · `cloning` · `scanning` · `completed` · `failed` · `stopped` |
-| `refTips` | JSON map ref → commit SHA, frozen on first clone. Defines exactly which commits this scan covers |
-| `totalCommits` | Size of the sorted commit list |
-| `scannedCommits` | The checkpoint: how many commits from the top of the sorted list are fully scanned |
-| `lastScannedSha` | SHA at the checkpoint, used to confirm the list is identical on resume |
-| `deliveryCount` | Claims in a row without progress (like an SQS receive count); reset to 1 when a checkpoint advances. At `MAX_DELIVERIES` the scan goes to `failed` (our DLQ) |
-| `leaseOwner`, `leaseExpiresAt` | Which worker holds it and until when |
-| `leaseToken` | Fencing token, incremented on every claim. Every worker write includes it |
-| `stopRequested` | Set by the API; the worker obeys it between batches |
-| `runAfter` | Earliest time it may be claimed again (retry backoff) |
-| `error` | Last failure message |
-| `createdAt`, `updatedAt`, `finishedAt` | Timestamps |
+| **Ref tips** | Where every branch, tag and PR points when the scan starts. Saved once, so the scan's commit list never changes, even if people push new commits during the scan |
+| **Page** | 200 commits from the sorted list (`BATCH_SIZE`). The unit of work and of saving |
+| **Placeholder / checkpoint** | `scannedCommits`: how many commits from the top of the list are done. Plus `lastScannedSha`, the commit at that spot, to double-check on resume |
+| **Slot** | One "lane" inside a worker container. Each slot runs one scan at a time. 3 per container by default |
+| **Lease** | "This slot owns this scan until time X." The heartbeat keeps pushing X forward. If the slot dies, X passes and another slot may take the scan |
+| **Lease token** | A number that goes up every time someone takes the scan. Every save must carry the current number, so a slot that lost the scan can't save anything |
+| **Delivery count** | How many times in a row a slot took the scan without making progress. At 3 the scan is marked `failed`. Our version of a dead-letter queue |
 
-A unique partial index on `repoUrl WHERE status IN ('queued','cloning','scanning')` means one active scan per repo,
-even when two requests race.
+## Scan statuses
 
-**findings**
-
-| Column | Meaning |
+| Status | Meaning |
 |---|---|
-| `id` | Auto-increment; also the pagination cursor (insert order = scan order) |
-| `scanId` | Owning scan |
-| `commitSha`, `commitMessage`, `committedAt` | Commit info |
-| `committerName`, `committerEmail`, `authorName`, `authorEmail` | Who |
-| `filePath`, `lineNumber` | Where (line number in the new file) |
-| `leakType` | `aws_access_key_id` or `aws_secret_access_key` |
-| `leakValue` | The full value (the assignment asks for it) |
+| `queued` | Waiting for a slot (new, retrying after an error, or resumed) |
+| `cloning` | A slot owns it and is downloading the repo and building the list |
+| `scanning` | Going through the pages. Progress = `scannedCommits / totalCommits` |
+| `completed` | Done. Final |
+| `failed` | Stopped for good: repo not found, bad token, history rewritten, or too many tries. `POST /resume` puts it back in the queue |
+| `stopped` | Someone called `POST /stop`. `POST /resume` puts it back in the queue |
 
-Unique on `(scanId, commitSha, filePath, lineNumber, leakValue)` with `INSERT OR IGNORE`, so replaying a batch after a
-crash never duplicates findings.
+Every status change is checked against a list of allowed moves (`src/domain/scanStateMachine.ts`) and saved with
+"change it *only if* it's still in the status I think it's in". If someone else changed it first, nothing is saved.
 
-## Scan state machine
+## When things go wrong
 
-```mermaid
-stateDiagram-v2
-  [*] --> queued: POST /scans
-  queued --> cloning: worker claims
-  cloning --> scanning: clone ready, ref tips frozen
-  scanning --> completed: last batch written
-  cloning --> queued: retryable error (backoff) / shutdown
-  scanning --> queued: retryable error (backoff) / shutdown
-  cloning --> failed: non-retryable or deliveries exhausted
-  scanning --> failed: non-retryable or deliveries exhausted
-  queued --> stopped: stop requested
-  cloning --> stopped: stop requested
-  scanning --> stopped: stop requested
-  stopped --> queued: POST /resume
-  failed --> queued: POST /resume
-  completed --> [*]
+| What happens | What the system does |
+|---|---|
+| A worker crashes in the middle of a page | That page was never saved. The heartbeat stops, the lease runs out after 30 s, another slot takes the scan, downloads again, and continues from the last saved page |
+| A worker freezes, then wakes up after someone else took its scan | Its saves carry an old lease token, so they change nothing. It notices and stops. It also has its own download folder, so it can't delete the new owner's files |
+| Network error or timeout talking to GitHub | The scan goes back to `queued` and waits 5 s, then 10 s, then 20 s before it can be taken again |
+| A repo makes every worker crash | Each takeover counts as a delivery. After 3 in a row with no progress, the scan is marked `failed` instead of crashing more workers |
+| Repo not found or bad token | `failed` at once. No retries, since retrying won't help |
+| Someone force-pushed and the saved commits are gone | `failed` with "history changed, start a new scan". We never continue a placeholder on a different list |
+| You call stop | A waiting scan stops at once. A running one stops after the current page |
+| The containers are shut down (deploy, `docker compose down`) | Running scans are put back in the queue without counting a delivery, and continue on the next start |
+| The same page is scanned twice | Findings have a unique key, so duplicates are ignored |
+| Invalid input / unknown scan / wrong state | 400 / 404 / 409 |
+
+## Many scans at once
+
+- 2 worker containers × 3 slots = 6 scans at the same time. A new repo doesn't wait for a big one to finish; it waits
+  only if all 6 slots are busy. To go faster, add worker containers.
+- One scan is always done by one slot, in order, because "newest first" and the placeholder need one ordered list.
+- What keeps it safe:
+  - **taking a scan** is one locked database step (`BEGIN IMMEDIATE`);
+  - **the lease token** stops a slot that lost its scan from saving;
+  - **one active scan per repo** is a database rule (a unique index), not a check in our code;
+  - **findings and placeholder in one transaction**, plus the unique key on findings, means no gaps and no duplicates;
+  - **one download folder per claim**, so slots never share files.
+
+## Big repos
+
+| Problem | What we do |
+|---|---|
+| Huge download | Blobless clone: start with commits and folders only; file contents come one page at a time, in one request per page |
+| Huge diffs | Read line by line from git, never the whole output at once. Files over 50 MB are skipped as binary |
+| Many branches | One download gets them all; a commit on 500 branches is scanned once |
+| Long scans and crashes | A save every page, so a crash loses at most one page |
+| Many commits | The sorted list is just SHA + time, about 100 MB per million commits |
+| Many findings | The findings API pages with a cursor (`id > last seen`), so it stays fast |
+
+Not built yet, but designed: splitting one giant repo across several workers, sorting on disk for 10M+ commits, and
+checking each line while streaming instead of per commit. See `DESIGN_DECISIONS.md` sections 13 and 20.
+
+## Where things are in the code
+
+```
+src/
+  apiMain.ts         start the API container
+  workerMain.ts      start a worker container
+  bootstrap.ts       what both need: config, logger ([api]/[worker] prefix), DB, shutdown
+  config.ts          env vars, checked with Zod
+  api/               HTTP routes, input checks, error codes
+  services/          what the API does (create, stop, resume...), no HTTP in here
+  worker/            the slots: take a scan, heartbeat, retry or fail, shut down cleanly
+  scanner/           scanRunner: clone → list → pages; detector: the AWS key patterns
+  git/               runs git: clone, list and sort commits, prefetch file contents, read diffs
+  db/                all SQL: tables, taking a scan, leases, placeholder, findings
+  domain/            the shapes (Zod) and the allowed status moves
 ```
 
-- Every status change goes through `transition(scanId, from, to, leaseToken)`. It checks the table above, then runs
-  `UPDATE … WHERE id = ? AND status = ? AND leaseToken = ?`. Zero rows updated means someone else changed the scan first.
-  The caller gets a "lost" result and stops; nothing is overwritten.
-- A worker crash leaves a scan in `cloning`/`scanning` with an expired lease. The claim query picks those up as well, so
-  no extra state is needed for "orphaned".
-
-## Flows
-
-### Happy path
-1. `POST /scans {repoUrl}`: validate and normalize the URL. Insert a `queued` scan. If the unique index rejects it, return
-   the active scan for that repo (200) instead of 202.
-2. A worker slot claims: in one transaction it selects the oldest claimable scan (`queued` and `runAfter <= now`, or
-   `cloning`/`scanning` with an expired lease), sets status `cloning`, its lease, `leaseToken + 1`, `deliveryCount + 1`.
-3. Heartbeat: every `LEASE_MS / 3` the slot renews the lease (fenced by `leaseToken`) and reads `stopRequested`.
-4. Clone: `git clone --mirror --filter=blob:none` into `CLONES_DIR/<scanId>-<leaseToken>` (history and trees only; file
-   contents are fetched by git page by page when step 6 diffs them). On the first run, read all ref tips and save them as
-   `refTips`. On a resume, check every frozen tip still exists in the clone.
-5. `cloning → scanning`. List commits reachable from `refTips` with committer time, sort by time desc, then SHA. Check
-   that the commit at `scannedCommits` matches `lastScannedSha`.
-6. For each batch of `BATCH_SIZE` commits after the checkpoint: stream
-   `git log -p --no-walk=unsorted --stdin --no-renames --format=…` with those SHAs, parse, run the detector on added
-   lines, then in **one transaction** insert findings and advance `scannedCommits`/`lastScannedSha` (fenced).
-7. `scanning → completed`, delete the clone directory.
-8. `GET /scans/:id` shows progress (`scannedCommits / totalCommits`); `GET /scans/:id/findings?cursor=&limit=` pages
-   findings.
-
-### Failure paths
-| What fails | What happens |
-|---|---|
-| Invalid `repoUrl` | 400, nothing stored |
-| Repo not found / bad token (git stderr) | Non-retryable: `failed` with the error, clone dir deleted |
-| Network error, timeout during clone | Retryable: back to `queued` with `runAfter = now + base * 2^(deliveryCount-1)`; `failed` after `MAX_DELIVERIES` |
-| Worker process crashes mid-batch | The batch transaction never committed. The lease expires, another slot claims it, re-clones, resumes at the checkpoint. Any partial work is redone; the unique key stops duplicates |
-| Worker is slow, its lease expires, another worker takes over | The old worker's next fenced write updates 0 rows → it aborts and kills its git process. Only the new holder can write |
-| A repo crashes every worker that takes it (e.g. out of memory) | Each reclaim adds a delivery; at `MAX_DELIVERIES` the claim query moves it to `failed` instead of claiming it again |
-| A stalled worker cleans up after losing its lease | Clone dirs are per claim (`<scanId>-<leaseToken>`), so it can only delete its own |
-| Heartbeat can't renew | Same as above: the slot aborts the run |
-| History rewritten between crash and resume (frozen tip SHA gone) | `failed` with "history changed, start a new scan". We never scan a different list under the same checkpoint |
-| `POST /stop` | `queued` → `stopped` immediately. A running scan: the heartbeat sees the flag, the runner stops after the current batch, `stopped`, clone deleted |
-| `POST /resume` on `stopped`/`failed` | → `queued` with `deliveryCount = 0`; continues from its checkpoint |
-| Invalid transition (stop a completed scan, resume a running one) | 409 |
-| SIGTERM | Stop claiming, abort runners, release their scans to `queued` without counting an attempt, delete clones, close the DB |
-| Leftover clone dirs after a crash | Each worker wipes its own clone root at start |
-
-### Concurrency rules
-- **Claiming** is one SQLite write transaction (`BEGIN IMMEDIATE`), so two slots can never claim the same scan. With
-  Postgres this becomes `SELECT … FOR UPDATE SKIP LOCKED`.
-- **Fencing token** on every worker write: a worker that lost its lease can't write anything.
-- **One active scan per repo** is enforced by the unique partial index, not by a read-then-write check.
-- **Idempotent writes**: findings unique key + checkpoint in the same transaction = exactly-once results.
-- **Isolation on disk**: one clone directory per scan, owned by the slot that holds the lease.
-- A scan is processed in order (required); throughput comes from many scans at once (`WORKER_CONCURRENCY` slots per
-  worker × worker containers).
-
-## Scale
-
-| Dimension | Approach |
-|---|---|
-| Many commits (1M+) | Commit list = SHA + timestamp, about 100 MB for 1M commits in memory. Diffs are streamed line by line, so memory doesn't grow with history. Checkpoints every batch bound the work lost to a crash. Beyond ~10M commits: sort with `git log --format='%ct %H' \| sort` on disk instead of in memory |
-| Many branches / PRs | One mirror clone fetches all refs at once; we scan commits, not branches, so a commit on 500 branches is scanned once |
-| Large files and diffs | Streamed; binary files skipped by git. `core.bigFileThreshold` (config, default 50 MB) makes git treat bigger blobs as binary. `--no-renames` avoids rename detection, which is slow on huge commits |
-| Huge clone on disk | Blobless bare mirror: file contents arrive only as each page of commits is diffed. Deleted as soon as the worker lets go of the scan |
-| Many repos in a tenant | Each repo is a queued scan; add worker containers to scale out. Multi-host needs Postgres instead of SQLite: new SQL in the repositories, and repository calls become async |
-| One giant repo | Designed, not built: split the sorted list into ranges (shards), each its own job with its own checkpoint, merged by `committedAt` in the API |
-| Many findings | Keyset pagination on `findings.id` |
-| GitHub rate limits | Not an issue with clone: one fetch per scan attempt instead of one API call per commit |
-
-### Paging (where it happens and the trade-off)
-| Layer | How we page | Trade-off chosen |
-|---|---|---|
-| Getting history from GitHub | Blobless mirror clone: commits + trees up front; before each page, the blobs it needs are fetched in one request (`diff-tree` → missing → one `git fetch`), lazy fetch as fallback | Fast first finding and disk grows with progress, at the cost of needing the network during the whole scan (covered by retries + checkpoint). One request per page instead of ~one per commit keeps us clear of GitHub's git throttling. Rejected: full clone (slow start, full disk up front) and the REST API (~5,000 commits/hour, max 3,000 files per commit, patches dropped for large diffs, k-way merge across branches) |
-| Processing | Pages of `BATCH_SIZE` commits from the sorted list; each page = one transaction with its checkpoint | Bigger pages: fewer writes, more redo after a crash. Default 200 |
-| Sorted commit list | Held in memory (~100 MB per 1M commits) | Past ~10M commits: sort on disk, or page by time windows with checkpoint (window, index) |
-| Results | Keyset cursor on `findings.id` | Offset paging slows down with depth and skips/repeats rows while a scan is still writing |
-
-## Deployment
-- One Docker image (`node:24-alpine` + `git`), two entry points: the `api` service runs `dist/src/apiMain.js`, the
-  `worker` service runs `dist/src/workerMain.js`. Every log line is prefixed with its role (`[api]`, `[worker]`).
-- `docker-compose.yml`: `api` (port 3000) + `worker` with `replicas: 2`, sharing a named volume for the SQLite file.
-  Each worker's clone directory is local to its container.
-- SQLite in WAL mode works for several processes on one host. Several hosts need Postgres.
-- `GITHUB_TOKEN` is optional (public repos work without it) and is passed only to workers.
-
-## Config (env)
-`PORT`, `DATA_DIR`, `GITHUB_TOKEN`, `WORKER_CONCURRENCY` (3), `LEASE_MS` (30000), `POLL_MS` (1000),
-`BATCH_SIZE` (200), `MAX_DELIVERIES` (3), `RETRY_BASE_MS` (5000), `CLONE_TIMEOUT_MS` (600000), `BIG_FILE_THRESHOLD` (50m).
-
-## Detection
-- Access key ID: `\b(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b`.
-- Secret access key: a 40-character `[A-Za-z0-9/+=]{40}` value on a line that also has a keyword like `aws_secret`,
-  `secret_access_key`, `aws_secret_access_key` (case-insensitive).
-- Only added lines in non-merge commits. Every removed line was added by an earlier commit we also scan.
+Layers: routes → services → database. Workers → scan runner → git + detector → database.
 
 ## API
 
-| Method & path | Result |
+| Request | Answer |
 |---|---|
-| `POST /scans` `{repoUrl}` | 202 `{scanId}` new · 200 existing active scan · 400 invalid |
-| `GET /scans` | List of scans (newest first) |
-| `GET /scans/:scanId` | Status, progress, error, timestamps · 404 |
-| `GET /scans/:scanId/findings?cursor=&limit=` | `{findings, nextCursor}` |
+| `POST /scans` `{repoUrl}` | 202 new scan · 200 the scan already running for that repo · 400 bad URL |
+| `GET /scans` | All scans, newest first |
+| `GET /scans/:scanId` | Status, progress, error · 404 |
+| `GET /scans/:scanId/findings?limit=&cursor=` | `{findings, nextCursor}`; pass `nextCursor` back for the next page |
 | `POST /scans/:scanId/stop` | 202 · 409 if already finished |
 | `POST /scans/:scanId/resume` | 202 · 409 if not `stopped`/`failed` |
 | `GET /health` | 200 |
 
-## Out of scope (deliberately)
-- Scanning merge diffs (`--cc`). Evil merges that add content only in the merge are missed.
-- Verifying keys against AWS, entropy scoring, other secret types.
-- Git LFS content (only the pointer files are scanned).
-- Incremental rescans (only commits new since the last completed scan). The frozen `refTips` would make this easy.
-- Sharding one repo across workers. Designed above, not built.
-- Auth on our own API.
-- Concurrency tests (the design covers it; the assignment doesn't expect tests).
+## What counts as a leak
 
-## Plan
+- **Access key ID:** `AKIA`, `ASIA`, `ABIA` or `ACCA` followed by 16 capital letters or digits.
+- **Secret access key:** 40 characters of letters, digits, `/` and `+`, on a line that also has a name like
+  `aws_secret_access_key`, `AWS_SECRET` or `secretAccessKey`. Pure lowercase hex is skipped (those are git SHAs).
+- Only **added** lines in normal commits. A removed line was added by an earlier commit, which we also scan. Merge
+  commits are skipped because they only combine lines that were added elsewhere.
 
-**Workers:** me (orchestrator), Claude implementers, one Codex reviewer, one Claude worker that built the fixture repo.
-T1 lands alone first; everything after it builds on its schemas, data model and git contracts. Then three implementers
-work in parallel on separate files.
+## Deployment
 
-| Task | Content | Who | Depends on |
-|---|---|---|---|
-| T1 Foundation | Config, logger, domain schemas, state machine, database + tables, both repositories, git types (contracts only) | Implementer A | — |
-| T2 Git + detection | Git client, commit lister, diff parser, detector, their tests | Implementer B | T1 |
-| T3 Scanning | Scan runner, worker pool (claim, heartbeat, fencing, retry, shutdown), tested with a fake git client | Implementer A | T1 |
-| T4 API | Scan service, Fastify routes | Implementer C | T1 |
-| T5 Ship | Entry point wiring with roles, Dockerfile, compose, README, end-to-end run against the fixture repo | Me + one implementer | T2, T3, T4 |
+- One Docker image with Node 24 and git. The `api` service runs `apiMain.js`; the `worker` service runs `workerMain.js`
+  with 2 copies.
+- They share one Docker volume with the SQLite file. Each worker keeps its downloads inside its own container.
+- SQLite is fine for several containers on one machine. Several machines need Postgres.
+- `GITHUB_TOKEN` is optional (public repos don't need it) and only the workers get it.
 
-**Timeline (today):** T1 by 14:45 · T2, T3, T4 in parallel by 15:20 · T5 by 15:45 · README done 15:55 · interview
-~16:10. You review each task's diff before it is committed. Codex reviews T2–T4 together before T5.
+## Not built (on purpose)
 
-**If we run late, cut in this order:** stop/resume endpoints → Codex review → compose with 2 workers (keep one container).
+- Splitting one giant repo across workers.
+- Scanning merge commits ("evil merges").
+- Checking keys with AWS, other secret types, Git LFS files.
+- Scanning only new commits since the last scan (incremental scans).
+- Login on our own API.
+- Postgres and a real message queue (next step after this version).
 
 ## Decision log
-| Decision | Why | Alternative |
+
+| Decision | Why | What we didn't pick |
 |---|---|---|
-| Git clone, not GitHub API | One fetch for the whole history; no per-commit rate limit; no truncated diffs | API: one request per commit diff, days for a large repo |
-| Blobless clone (`--filter=blob:none`) | Pages the download: fast first finding, disk grows with progress | Full clone: everything up front |
-| Mirror clone, `--all` refs incl. PRs | Assignment: as inclusive as possible | Branches only |
-| Sort commits ourselves by committer time | Git's default order isn't strict under clock skew | Trust `git log` order |
-| Freeze ref tips at first clone | Resume sees the exact same commit list, so a position is a valid placeholder | Re-read refs on resume (list shifts when people push) |
-| Checkpoint + findings in one transaction, unique key on findings | Exactly-once results across crashes | Checkpoint separately (duplicates or gaps) |
-| DB-backed queue with leases + fencing token | Survives crashes; safe with many workers | In-memory queue (lost on crash) |
-| Explicit state machine with compare-and-set transitions | Every status change is checked and race-safe | Free-form status updates |
-| SQLite via `node:sqlite` | No extra service or package; transactions | Postgres (needed for multi-host; documented) |
-| Same image, separate `apiMain`/`workerMain` entry points | API and workers scale separately; each file reads top to bottom with no role branching | One entry point with a `ROLE` switch (fewer files, but branching and one process loads everything) |
-| Parallelism across scans, not inside one | Order is a requirement; branches share commits | Split by branch (rescans shared commits) |
-| Added lines only, skip merges | No double reports | Scan removed lines / `--cc` |
-| Clone dir lives only while a worker holds the lease | Simple cleanup rule; no shared disk between workers | Keep clones to reuse on resume |
-| Fastify | Schema validation, simple shutdown hooks | Express 5 |
+| Clone with git, not the GitHub API | One download for all history; the API allows ~5,000 requests an hour and cuts big diffs | GitHub REST API |
+| Blobless clone + one fetch per page | Fast start, disk grows as we go, few requests to GitHub | Full clone (slow start, all disk up front) |
+| Mirror clone with PR refs | Find leaks even on deleted PR branches | Branches only |
+| Sort commits ourselves | Git's own order can be wrong when commit dates are out of order | Trust `git log` order |
+| Save ref tips once | The list stays the same, so "N commits done" stays true | Read branches again on resume |
+| Findings + placeholder in one transaction | No gaps, no duplicates after a crash | Save them separately |
+| Queue in the database, with leases and tokens | Nothing lost on a crash; safe with many workers | In-memory queue; Redis/SQS |
+| Checked status changes | Every change is allowed and race-safe | Update status freely |
+| SQLite | Nothing to install, real transactions | Postgres (for many machines) |
+| Separate API and worker entry points | Each scales on its own; simple start-up files | One entry point with a `ROLE` switch |
+| One slot per scan, many scans at once | Order and placeholder need one list | Split by branch (scans shared commits again) |
+| Only added lines, skip merges | No double reports | Scan removed lines or merges |
+| Delivery count reset on progress | Only stuck scans go to `failed`, not long ones | Count every try forever |
+| Fastify | Input checks and clean shutdown built in | Express |
